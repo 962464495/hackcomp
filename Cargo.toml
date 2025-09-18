@@ -1,0 +1,24 @@
+[package]
+name = "hackcomp"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+android_logger = "0.15.1"
+libc = "0.2.175"
+log = "0.4.28"
+ndk = "0.9.0"
+ndk-sys = "0.6.0"
+pretty_env_logger = "0.5.0"
+seccompiler = { git = "https://github.com/lihe07/seccompiler.git" }
+syscalls = "0.6.18"
+thiserror = "2.0.16"
+[lib]
+name = "hackcomp"
+path = "src/lib.rs"
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "hackcomp"
+path = "src/main.rs"
