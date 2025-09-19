@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use crate::MapsParseError;
 
 /// Represents the permissions of a memory mapping.

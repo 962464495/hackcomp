@@ -1,7 +1,10 @@
-use std::ffi::{CStr, c_void};
+use std::{
+    arch::asm,
+    ffi::{c_int, c_void},
+};
 
-use libc::{c_char, c_int};
 use log::info;
+use syscalls::Sysno;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -30,89 +33,92 @@ pub struct SiginfoSeccompOverlay {
 }
 
 #[cfg(target_arch = "aarch64")]
-const ARG_REGS: [libc::c_int; 6] = [0, 1, 2, 3, 4, 5];
+const ARG_REGS: [c_int; 6] = [0, 1, 2, 3, 4, 5];
 
 #[cfg(target_arch = "aarch64")]
-const RET_REG: libc::c_int = 0;
+const RET_REG: c_int = 0;
 
 #[cfg(target_arch = "aarch64")]
-const SYSCALL_REG: libc::c_int = 8; // x8
-
-#[cfg(target_arch = "x86_64")]
-const ARG_REGS: [libc::c_int; 6] = [
-    libc::REG_RDI,
-    libc::REG_RSI,
-    libc::REG_RDX,
-    libc::REG_R10,
-    libc::REG_R8,
-    libc::REG_R9,
-];
-
-#[cfg(target_arch = "x86_64")]
-const RET_REG: libc::c_int = libc::REG_RAX;
-
-#[cfg(target_arch = "x86_64")]
-fn get_arg(context: *const libc::ucontext_t, idx: usize) -> usize {
-    unsafe { (*context).uc_mcontext.gregs[ARG_REGS[idx] as usize] as usize }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn set_ret(context: *mut libc::ucontext_t, ret: usize) {
-    unsafe {
-        (*context).uc_mcontext.gregs[RET_REG as usize] = ret as i64;
-    }
-}
+type Context = ndk_sys::ucontext_t;
 
 #[cfg(target_arch = "aarch64")]
-fn get_arg(context: *const ndk_sys::ucontext_t, idx: usize) -> usize {
+fn get_arg(context: *const Context, idx: usize) -> usize {
     unsafe { (*context).uc_mcontext.regs[ARG_REGS[idx] as usize] as usize }
 }
 
 #[cfg(target_arch = "aarch64")]
-fn set_ret(context: *mut ndk_sys::ucontext_t, ret: usize) {
+fn set_ret(context: *mut Context, ret: usize) {
     unsafe {
         (*context).uc_mcontext.regs[RET_REG as usize] = ret as u64;
     }
 }
 
 pub unsafe extern "C" fn sigsys_handler(
-    signal: libc::c_int,
+    signal: c_int,
     siginfo: *mut SiginfoSeccompOverlay,
-    context: *mut ndk_sys::ucontext_t,
+    context: *mut Context,
 ) {
-    if signal != libc::SIGSYS {
+    if signal != ndk_sys::SIGSYS as c_int {
         return;
     }
 
     unsafe {
-        dbg!(*siginfo);
+        // Prepare
+        let mut args = [0usize; 6];
 
-        info!("Caught signal: {signal}");
-        info!("Syscall: {}", (*siginfo).body.si_syscall);
-
-        dbg!((*context).uc_mcontext.regs);
-        dbg!((*context).uc_mcontext.regs[8]);
-
-        let dirfd = get_arg(context, 0) as i32;
-        let mut pathname_ptr = get_arg(context, 1) as *const c_char;
-        let flags = get_arg(context, 2);
-        dbg!(dirfd, pathname_ptr, flags);
-
-        let pathname = CStr::from_ptr(pathname_ptr);
-        info!("Trying to openat: dirfd={dirfd} pathname={pathname:?} flags={flags}");
-
-        if pathname.to_bytes().starts_with(b"/proc/") {
-            info!("Redir access to /proc/*");
-            pathname_ptr = CStr::from_bytes_with_nul(b"/proc/self/cmdline\0")
-                .unwrap()
-                .as_ptr();
+        for (i, arg) in args.iter_mut().enumerate() {
+            *arg = get_arg(context, i);
         }
+        // (*siginfo).body.si_call_addr
 
-        let r = match syscalls::syscall!(syscalls::Sysno::openat, dirfd, pathname_ptr, flags) {
-            Ok(ret) => ret as isize,
-            Err(e) => -e.into_raw() as isize,
+        let mut ctx = crate::SyscallContext {
+            syscall_number: Sysno::from((*siginfo).body.si_syscall),
+            args,
+            regs: (*context).uc_mcontext.regs,
+            call_addr: (*siginfo).body.si_call_addr as usize,
+            return_value: None,
         };
 
-        set_ret(context, r as usize);
+        let sysno = ctx.syscall_number;
+        // OnceLock will make sure no two handlers run concurrently
+        let mut h = crate::Hackcomp::get_installed().unwrap();
+        let mut hooks = h
+            .syscall_hooks
+            .iter_mut()
+            .filter(|hook| {
+                let hooked = hook.hooked_syscalls();
+                hooked.is_empty() || hooked.contains(&sysno)
+            })
+            .collect::<Vec<_>>();
+
+        // Run before hooks
+        for hook in hooks.iter_mut() {
+            hook.before(&mut ctx);
+        }
+
+        // If return_value is not set, do the real syscall
+        if ctx.return_value.is_none() {
+            // Fallback stub
+            let r = match syscalls::syscall6(
+                ctx.syscall_number,
+                ctx.args[0],
+                ctx.args[1],
+                ctx.args[2],
+                ctx.args[3],
+                ctx.args[4],
+                ctx.args[5],
+            ) {
+                Ok(ret) => ret as isize,
+                Err(e) => -e.into_raw() as isize,
+            };
+            ctx.return_value = Some(r as usize);
+        }
+
+        // Run after hooks
+        for hook in hooks {
+            hook.after(&mut ctx);
+        }
+
+        set_ret(context, ctx.return_value.unwrap());
     }
 }

@@ -1,30 +1,43 @@
 mod error;
 pub mod fs;
 mod handler;
+mod hooks;
 mod procfs;
 mod seccomp;
 
 use std::{
-    collections::HashMap,
-    ffi::{CStr, CString},
+    collections::{HashMap, HashSet},
+    ops::DerefMut,
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard, OnceLock},
 };
 
 pub use error::*;
+pub use hooks::*;
+
 use log::{debug, info};
 use seccompiler::{SeccompCmpOp, SeccompCondition, SeccompRule, TargetArch};
 
-pub trait MappedNode: std::fmt::Debug {
-    fn lseek(&mut self, offset: usize, whence: usize) -> usize;
-    fn read(&mut self, count: usize) -> Vec<u8>;
-}
+static GLOBAL: OnceLock<Mutex<Hackcomp>> = OnceLock::new();
 
 pub struct Hackcomp {
     program: seccompiler::BpfProgram,
+    syscall_hooks: Vec<Box<dyn SyscallHook>>,
 }
 
 impl Hackcomp {
-    pub fn install(&self) -> crate::Result<()> {
+    pub fn get_installed<'a>() -> Option<MutexGuard<'a, Hackcomp>> {
+        match GLOBAL.get() {
+            None => None,
+            Some(m) => m.lock().ok(),
+        }
+    }
+
+    pub fn install(self) -> crate::Result<()> {
+        if GLOBAL.get().is_some() {
+            return Err(crate::Error::AlreadyInstalled);
+        }
+
         debug!("PR_SET_NO_NEW_PRIVS 1");
         seccomp::set_no_new_privs()?;
 
@@ -34,27 +47,38 @@ impl Hackcomp {
 
         seccompiler::apply_filter_all_threads(&self.program)?;
 
+        // Transfer ownership to static CELL
+        GLOBAL
+            .set(Mutex::new(self))
+            .map_err(|_| crate::Error::AlreadyInstalled)?;
+
         Ok(())
     }
 }
 
-#[derive(Debug)]
 pub struct Builder {
     pc_white_list: (usize, usize),
-    fs_mappings: HashMap<PathBuf, Box<dyn MappedNode>>,
+    syscall_hooks: Vec<Box<dyn SyscallHook>>,
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Builder {
     pub fn new() -> Self {
         Builder {
             pc_white_list: (0, 0),
-            fs_mappings: HashMap::new(),
+            syscall_hooks: Vec::new(),
         }
     }
 
-    pub fn add_mapping<P: AsRef<Path>, M: MappedNode + 'static>(&mut self, path: P, node: M) {
-        self.fs_mappings
-            .insert(path.as_ref().to_owned(), Box::new(node));
+    pub fn add_hook<H: SyscallHook + 'static>(mut self, hook: H) -> Self {
+        self.syscall_hooks.push(Box::new(hook));
+
+        self
     }
 
     pub fn white_list_self(&mut self) -> crate::Result<()> {
@@ -97,18 +121,26 @@ impl Builder {
             return Err(crate::Error::UnsupportedArch);
         };
 
-        dbg!(arch);
+        let mut rules: Vec<(i64, Vec<SeccompRule>)> = vec![];
 
-        let filters = seccompiler::SeccompFilter::new(
-            vec![(
-                libc::SYS_openat,
+        let keys: HashSet<Sysno> = HashSet::from_iter(
+            self.syscall_hooks
+                .iter()
+                .flat_map(|h| h.hooked_syscalls().iter().cloned()),
+        );
+
+        for hook in keys {
+            rules.push((
+                hook as i64,
                 vec![
                     SeccompRule::new(vec![self.white_list_cond1()?])?,
                     SeccompRule::new(vec![self.white_list_cond2()?])?,
                 ],
-            )]
-            .into_iter()
-            .collect(),
+            ));
+        }
+
+        let filters = seccompiler::SeccompFilter::new(
+            rules.into_iter().collect(),
             // mismatch
             seccompiler::SeccompAction::Allow,
             // match
@@ -117,6 +149,7 @@ impl Builder {
         )?;
 
         Ok(Hackcomp {
+            syscall_hooks: self.syscall_hooks,
             program: filters.try_into().unwrap(),
         })
     }

@@ -1,18 +1,5 @@
 /// fs.rs - util funcs with direct SVC calls
-use std::{
-    ffi::{CStr, CString, OsStr},
-    mem::MaybeUninit,
-    os::unix::ffi::OsStrExt,
-    path::Path,
-    str::FromStr,
-};
-use syscalls::{Sysno, syscall};
-
-impl From<syscalls::Errno> for crate::Error {
-    fn from(value: syscalls::Errno) -> Self {
-        std::io::Error::from_raw_os_error(value.into_raw()).into()
-    }
-}
+use std::path::Path;
 
 pub fn read_all(path: impl AsRef<Path>) -> crate::Result<Vec<u8>> {
     const CHUNK_SIZE: usize = 4096; // Read in 4KB chunks
@@ -21,17 +8,12 @@ pub fn read_all(path: impl AsRef<Path>) -> crate::Result<Vec<u8>> {
         // std::io::Error::from_raw_os_error
         let path = path.as_ref();
 
-        let fd = syscalls::syscall!(
-            Sysno::openat,
-            libc::AT_FDCWD,
-            CString::new(path.as_os_str().as_bytes()).unwrap().as_ptr(),
-            libc::O_RDONLY
-        )?;
+        let fd = nc::openat(nc::AT_FDCWD, path, nc::O_RDONLY, 0)?;
 
-        let mut stat_buf = MaybeUninit::<libc::stat>::uninit();
-        syscall!(Sysno::fstat, fd, stat_buf.as_mut_ptr())?;
+        let mut stat_buf = nc::stat_t::default();
+        nc::fstat(fd, &mut stat_buf)?;
 
-        let size = stat_buf.assume_init().st_size as usize;
+        let size = stat_buf.st_size as usize;
         dbg!(size);
 
         let mut buf;
@@ -39,7 +21,7 @@ pub fn read_all(path: impl AsRef<Path>) -> crate::Result<Vec<u8>> {
         if size > 0 {
             // --- Path 1: Known Size (for regular files) ---
             buf = vec![0u8; size];
-            syscall!(Sysno::read, fd, buf.as_mut_ptr() as usize, size)?;
+            nc::read(fd, &mut buf)?;
         } else {
             // --- Path 2: Zero Size (for /proc files or empty files) ---
             buf = Vec::with_capacity(CHUNK_SIZE); // Start with a reasonable capacity
@@ -47,8 +29,7 @@ pub fn read_all(path: impl AsRef<Path>) -> crate::Result<Vec<u8>> {
 
             loop {
                 // Read a chunk from the file
-                let bytes_read =
-                    syscall!(Sysno::read, fd, tmp_buf.as_mut_ptr() as usize, CHUNK_SIZE)?;
+                let bytes_read = nc::read(fd, &mut tmp_buf)? as usize;
 
                 if bytes_read == 0 {
                     // 0 bytes read means we've reached the end of the file
@@ -60,7 +41,7 @@ pub fn read_all(path: impl AsRef<Path>) -> crate::Result<Vec<u8>> {
             }
         }
 
-        syscall!(Sysno::close, fd)?;
+        nc::close(fd)?;
         Ok(buf)
     }
 }

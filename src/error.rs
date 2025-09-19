@@ -7,6 +7,9 @@ pub enum Error {
     #[error("general io error")]
     IO(#[from] std::io::Error),
 
+    #[error("syscall error: {0}")]
+    Syscall(nc::Errno),
+
     #[error("maps parse error")]
     MapsParseError(#[from] MapsParseError),
 
@@ -19,8 +22,17 @@ pub enum Error {
     #[error("unsupported architecture")]
     UnsupportedArch,
 
+    #[error("already installed")]
+    AlreadyInstalled,
+
     #[error("Unknown error")]
     Unknown,
+}
+
+impl From<nc::Errno> for Error {
+    fn from(value: nc::Errno) -> Self {
+        Error::Syscall(value)
+    }
 }
 
 #[derive(Error, Debug)]
