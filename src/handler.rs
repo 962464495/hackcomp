@@ -62,6 +62,7 @@ pub unsafe extern "C" fn sigsys_handler(
         return;
     }
 
+    info!("In SIGSYS handler");
     unsafe {
         // Prepare
         let mut args = [0usize; 6];
@@ -69,7 +70,6 @@ pub unsafe extern "C" fn sigsys_handler(
         for (i, arg) in args.iter_mut().enumerate() {
             *arg = get_arg(context, i);
         }
-        // (*siginfo).body.si_call_addr
 
         let mut ctx = crate::SyscallContext {
             syscall_number: Sysno::from((*siginfo).body.si_syscall),

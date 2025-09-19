@@ -8,6 +8,7 @@ fn main() {
     info!("Hello");
 
     let h = hackcomp::Builder::new()
+        .add_hook(hackcomp::HideSeccomp::new())
         .add_hook(hackcomp::SysLogger::new(&[Sysno::openat, Sysno::read]))
         .add_hook(hackcomp::FDRedirect::new(
             PathBuf::from("/proc/self/cmdline"),
@@ -39,6 +40,13 @@ fn main() {
     .ok();
 
     unsafe {
-        dbg!(libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0));
+        dbg!(ndk_sys::syscall(
+            hackcomp::Sysno::prctl as i64,
+            libc::PR_GET_NO_NEW_PRIVS,
+            0,
+            0,
+            0,
+            0
+        ));
     }
 }

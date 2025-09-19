@@ -5,20 +5,17 @@ mod hooks;
 mod procfs;
 mod seccomp;
 
-use std::{
-    collections::{HashMap, HashSet},
-    ops::DerefMut,
-    path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard, OnceLock},
-};
+use std::collections::{BTreeMap, HashSet};
 
 pub use error::*;
 pub use hooks::*;
 
-use log::{debug, info};
-use seccompiler::{SeccompCmpOp, SeccompCondition, SeccompRule, TargetArch};
+use seccompiler::TargetArch;
+pub use seccompiler::{SeccompCmpOp, SeccompCondition, SeccompRule};
 
-static GLOBAL: OnceLock<Mutex<Hackcomp>> = OnceLock::new();
+use log::{debug, info};
+
+static GLOBAL: spin::Once<spin::Mutex<Hackcomp>> = spin::Once::new();
 
 pub struct Hackcomp {
     program: seccompiler::BpfProgram,
@@ -26,11 +23,8 @@ pub struct Hackcomp {
 }
 
 impl Hackcomp {
-    pub fn get_installed<'a>() -> Option<MutexGuard<'a, Hackcomp>> {
-        match GLOBAL.get() {
-            None => None,
-            Some(m) => m.lock().ok(),
-        }
+    pub fn get_installed<'a>() -> Option<spin::MutexGuard<'a, Hackcomp>> {
+        GLOBAL.get().map(|f| f.lock())
     }
 
     pub fn install(self) -> crate::Result<()> {
@@ -48,9 +42,7 @@ impl Hackcomp {
         seccompiler::apply_filter_all_threads(&self.program)?;
 
         // Transfer ownership to static CELL
-        GLOBAL
-            .set(Mutex::new(self))
-            .map_err(|_| crate::Error::AlreadyInstalled)?;
+        GLOBAL.call_once(|| spin::Mutex::new(self));
 
         Ok(())
     }
@@ -111,6 +103,7 @@ impl Builder {
     }
 
     pub fn build(mut self) -> crate::Result<Hackcomp> {
+        info!("Building hackcomp with {} hooks", self.syscall_hooks.len());
         self.white_list_self()?;
 
         let arch = if cfg!(target_arch = "aarch64") {
@@ -121,26 +114,39 @@ impl Builder {
             return Err(crate::Error::UnsupportedArch);
         };
 
-        let mut rules: Vec<(i64, Vec<SeccompRule>)> = vec![];
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
-        let keys: HashSet<Sysno> = HashSet::from_iter(
-            self.syscall_hooks
-                .iter()
-                .flat_map(|h| h.hooked_syscalls().iter().cloned()),
-        );
+        // let keys: HashSet<Sysno> = HashSet::from_iter(
+        //     self.syscall_hooks
+        //         .iter()
+        //         .flat_map(|h| h.hooked_syscalls().iter().cloned()),
+        // );
 
-        for hook in keys {
-            rules.push((
-                hook as i64,
-                vec![
-                    SeccompRule::new(vec![self.white_list_cond1()?])?,
-                    SeccompRule::new(vec![self.white_list_cond2()?])?,
-                ],
-            ));
+        for hook in &self.syscall_hooks {
+            for sysno in hook.hooked_syscalls() {
+                let mut custom_rules = hook.bpf_rules(*sysno);
+
+                for r in custom_rules.drain(..) {
+                    let mut cond1 = vec![self.white_list_cond1()?];
+                    cond1.extend(r.iter().cloned());
+                    let mut cond2 = vec![self.white_list_cond2()?];
+                    cond2.extend(r.into_iter());
+
+                    if let Some(v) = rules.get_mut(&(*sysno as i64)) {
+                        v.push(SeccompRule::new(cond1)?);
+                        v.push(SeccompRule::new(cond2)?);
+                    } else {
+                        rules.insert(
+                            *sysno as i64,
+                            vec![SeccompRule::new(cond1)?, SeccompRule::new(cond2)?],
+                        );
+                    }
+                }
+            }
         }
 
         let filters = seccompiler::SeccompFilter::new(
-            rules.into_iter().collect(),
+            rules,
             // mismatch
             seccompiler::SeccompAction::Allow,
             // match

@@ -1,10 +1,10 @@
 use std::{
-    collections::HashMap,
     ffi::{CStr, CString},
     path::PathBuf,
 };
 
 use log::debug;
+use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
 pub use syscalls::Sysno; // Re-export Sysno for convenience
 
 pub trait MappedNode: std::fmt::Debug {
@@ -24,6 +24,10 @@ pub struct SyscallContext {
 pub trait SyscallHook: Send + Sync {
     fn hooked_syscalls(&self) -> &[Sysno] {
         &[]
+    }
+
+    fn bpf_rules(&self, _sysno: Sysno) -> Vec<Vec<SeccompCondition>> {
+        vec![]
     }
 
     /// To be called before the syscall is executed.
@@ -69,7 +73,7 @@ impl SyscallHook for SysLogger {
 pub struct FDRedirect {
     from_path: PathBuf,
     to_path: PathBuf,
-    fd_map: HashMap<usize, usize>, // from_fd -> to_fd
+    fd_map: Vec<(usize, usize)>, // from_fd, to_fd
 }
 
 impl FDRedirect {
@@ -84,8 +88,17 @@ impl FDRedirect {
         Self {
             from_path,
             to_path,
-            fd_map: HashMap::new(),
+            fd_map: Vec::new(),
         }
+    }
+
+    fn get_mapped(&self, fd: usize) -> Option<usize> {
+        for (from_fd, to_fd) in &self.fd_map {
+            if *from_fd == fd {
+                return Some(*to_fd);
+            }
+        }
+        None
     }
 }
 
@@ -107,14 +120,26 @@ impl SyscallHook for FDRedirect {
                     .into_owned();
                 let full_path = if dirfd == nc::AT_FDCWD {
                     PathBuf::from(&pathname)
-                } else if let Some(fd) = self.fd_map.get(&(dirfd as usize)) {
-                    if let Ok(dir_path) = std::fs::read_link(format!("/proc/self/fd/{fd}")) {
-                        dir_path.join(&pathname)
+                } else {
+                    let mut dir_path = [0_u8; nc::PATH_MAX as usize + 1];
+                    if unsafe {
+                        nc::readlinkat(
+                            nc::AT_FDCWD,
+                            format!("/proc/self/fd/{dirfd}"),
+                            &mut dir_path,
+                        )
+                        .is_ok()
+                    } {
+                        PathBuf::from(
+                            CStr::from_bytes_with_nul(&dir_path)
+                                .unwrap()
+                                .to_str()
+                                .unwrap(),
+                        )
+                        .join(&pathname)
                     } else {
                         PathBuf::from(&pathname)
                     }
-                } else {
-                    PathBuf::from(&pathname)
                 };
 
                 if full_path != self.from_path {
@@ -127,51 +152,104 @@ impl SyscallHook for FDRedirect {
                     self.to_path.display()
                 );
 
-                let to_path = CString::new(self.to_path.to_string_lossy().as_bytes()).unwrap();
-
                 // Open both files to get their fds
                 unsafe {
-                    let from_fd =
-                        syscalls::syscall!(Sysno::openat, dirfd, pathname_ptr, flags, mode);
+                    let from_fd = nc::openat(dirfd, pathname, flags, mode);
+                    debug!("from_fd: {from_fd:?}");
 
                     if let Err(e) = from_fd {
-                        ctx.return_value = Some(-e.into_raw() as usize);
+                        ctx.return_value = Some(-e as usize);
                         return;
                     }
 
-                    let to_fd =
-                        syscalls::syscall!(Sysno::openat, dirfd, to_path.as_ptr(), flags, mode);
+                    let to_fd = nc::openat(dirfd, &self.to_path, flags, mode);
+                    debug!("to_fd: {to_fd:?}");
 
                     if let Err(e) = from_fd {
-                        ctx.return_value = Some(-e.into_raw() as usize);
+                        ctx.return_value = Some(-e as usize);
                         return;
                     }
 
                     self.fd_map
-                        .insert(from_fd.unwrap() as usize, to_fd.unwrap() as usize);
+                        .push((from_fd.unwrap() as usize, to_fd.unwrap() as usize));
                     ctx.return_value = Some(to_fd.unwrap() as usize);
                 }
             }
             Sysno::read | Sysno::lseek | Sysno::write => {
                 let fd = ctx.args[0];
-                if let Some(&to_fd) = self.fd_map.get(&fd) {
+                if let Some(to_fd) = self.get_mapped(fd) {
                     ctx.args[0] = to_fd;
                     debug!("Redirected read/lseek from fd {fd} to fd {to_fd}");
                 }
             }
             Sysno::close => {
                 let fd = ctx.args[0];
-                if let Some(&to_fd) = self.fd_map.get(&fd) {
+                if let Some(to_fd) = self.get_mapped(fd) {
                     // We close both
                     unsafe {
                         syscalls::syscall!(Sysno::close, to_fd as i32).ok();
                         syscalls::syscall!(Sysno::close, fd as i32).ok();
                         ctx.return_value = Some(0);
                     }
-                    self.fd_map.remove(&fd);
+                    self.fd_map.retain(|(f, _)| *f != fd);
                 }
             }
             _ => unimplemented!(),
+        }
+    }
+}
+
+pub struct HideSeccomp {}
+
+impl HideSeccomp {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl SyscallHook for HideSeccomp {
+    fn hooked_syscalls(&self) -> &[Sysno] {
+        &[Sysno::prctl]
+    }
+    fn bpf_rules(&self, sysno: Sysno) -> Vec<Vec<SeccompCondition>> {
+        if sysno == Sysno::prctl {
+            // Allow prctl but we will handle it in before()
+            vec![
+                vec![
+                    SeccompCondition::new(
+                        0,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Eq,
+                        nc::PR_SET_SECCOMP as u64,
+                    )
+                    .unwrap(),
+                ],
+                vec![
+                    SeccompCondition::new(
+                        0,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Eq,
+                        nc::PR_GET_NO_NEW_PRIVS as u64,
+                    )
+                    .unwrap(),
+                ],
+            ]
+        } else {
+            vec![]
+        }
+    }
+
+    fn before(&mut self, ctx: &mut SyscallContext) {
+        if ctx.syscall_number == Sysno::prctl {
+            log::info!("Hiding seccomp prctl call");
+            let option = ctx.args[0];
+            if option == nc::PR_SET_SECCOMP as usize
+                || option == nc::PR_GET_SECCOMP as usize
+                || option == nc::PR_SET_NO_NEW_PRIVS as usize
+                || option == nc::PR_GET_NO_NEW_PRIVS as usize
+            {
+                ctx.return_value = Some(0); // pretend success
+            }
         }
     }
 }
