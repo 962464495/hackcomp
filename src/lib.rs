@@ -2,7 +2,7 @@ mod error;
 pub mod fs;
 mod handler;
 mod hooks;
-mod procfs;
+pub mod procfs;
 mod seccomp;
 
 use std::collections::{BTreeMap, HashSet};
@@ -125,6 +125,10 @@ impl Builder {
         for hook in &self.syscall_hooks {
             for sysno in hook.hooked_syscalls() {
                 let mut custom_rules = hook.bpf_rules(*sysno);
+
+                if custom_rules.is_empty() {
+                    custom_rules.push(vec![]);
+                }
 
                 for r in custom_rules.drain(..) {
                     let mut cond1 = vec![self.white_list_cond1()?];

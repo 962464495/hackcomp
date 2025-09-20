@@ -62,7 +62,7 @@ pub unsafe extern "C" fn sigsys_handler(
         return;
     }
 
-    info!("In SIGSYS handler");
+    // info!("In SIGSYS handler");
     unsafe {
         // Prepare
         let mut args = [0usize; 6];
