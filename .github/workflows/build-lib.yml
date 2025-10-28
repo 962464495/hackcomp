@@ -1,0 +1,226 @@
+name: Build Android Library
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-android-lib:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        # 编译 debug 和 release 两个版本
+        build_type: [debug, release]
+        # 支持多个架构
+        target: [aarch64, armv7, x86_64]
+        include:
+          - target: aarch64
+            rust_target: aarch64-linux-android
+            ndk_target: arm64-v8a
+            ndk_clang: aarch64-linux-android21-clang
+          - target: armv7
+            rust_target: armv7-linux-androideabi
+            ndk_target: armeabi-v7a
+            ndk_clang: armv7a-linux-androideabi21-clang
+          - target: x86_64
+            rust_target: x86_64-linux-android
+            ndk_target: x86_64
+            ndk_clang: x86_64-linux-android21-clang
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust Android target
+      run: rustup target add ${{ matrix.rust_target }}
+
+    - name: Download and install Android NDK
+      run: |
+        wget https://dl.google.com/android/repository/android-ndk-r27b-linux.zip -O ndk.zip
+        unzip -q ndk.zip
+        mv android-ndk-r27b $HOME/ndk
+        echo "NDK_HOME=$HOME/ndk" >> $GITHUB_ENV
+
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk
+
+    - name: Configure .cargo/config.toml
+      run: |
+        mkdir -p .cargo
+        echo '[target.${{ matrix.rust_target }}]' > .cargo/config.toml
+        echo 'ar = "${{ env.NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"' >> .cargo/config.toml
+        echo 'linker = "${{ env.NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.ndk_clang }}"' >> .cargo/config.toml
+
+    - name: Build library (debug)
+      if: matrix.build_type == 'debug'
+      run: cargo ndk -t ${{ matrix.ndk_target }} build --lib
+
+    - name: Build library (release)
+      if: matrix.build_type == 'release'
+      run: cargo ndk -t ${{ matrix.ndk_target }} build --lib --release
+
+    - name: Verify library output
+      run: |
+        if [ "${{ matrix.build_type }}" == "debug" ]; then
+          ls -lh target/${{ matrix.rust_target }}/debug/libhackcomp.so
+          file target/${{ matrix.rust_target }}/debug/libhackcomp.so
+        else
+          ls -lh target/${{ matrix.rust_target }}/release/libhackcomp.so
+          file target/${{ matrix.rust_target }}/release/libhackcomp.so
+        fi
+
+    - name: Strip release binary
+      if: matrix.build_type == 'release'
+      run: |
+        ${{ env.NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
+          target/${{ matrix.rust_target }}/release/libhackcomp.so
+
+    - name: Upload artifact (debug)
+      if: matrix.build_type == 'debug'
+      uses: actions/upload-artifact@v4
+      with:
+        name: libhackcomp-${{ matrix.target }}-debug
+        path: target/${{ matrix.rust_target }}/debug/libhackcomp.so
+
+    - name: Upload artifact (release)
+      if: matrix.build_type == 'release'
+      uses: actions/upload-artifact@v4
+      with:
+        name: libhackcomp-${{ matrix.target }}-release
+        path: target/${{ matrix.rust_target }}/release/libhackcomp.so
+
+  # 打包所有架构的库到一个 zip 文件
+  package-all:
+    needs: build-android-lib
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./artifacts
+
+    - name: Create package structure
+      run: |
+        mkdir -p package/lib/arm64-v8a
+        mkdir -p package/lib/armeabi-v7a
+        mkdir -p package/lib/x86_64
+
+        # 复制 release 版本（推荐用于生产）
+        cp artifacts/libhackcomp-aarch64-release/libhackcomp.so package/lib/arm64-v8a/
+        cp artifacts/libhackcomp-armv7-release/libhackcomp.so package/lib/armeabi-v7a/
+        cp artifacts/libhackcomp-x86_64-release/libhackcomp.so package/lib/x86_64/
+
+        # 创建调试版本目录
+        mkdir -p package-debug/lib/arm64-v8a
+        mkdir -p package-debug/lib/armeabi-v7a
+        mkdir -p package-debug/lib/x86_64
+
+        cp artifacts/libhackcomp-aarch64-debug/libhackcomp.so package-debug/lib/arm64-v8a/
+        cp artifacts/libhackcomp-armv7-debug/libhackcomp.so package-debug/lib/armeabi-v7a/
+        cp artifacts/libhackcomp-x86_64-debug/libhackcomp.so package-debug/lib/x86_64/
+
+    - name: Create README
+      run: |
+        cat > package/README.md << 'EOF'
+        # Hackcomp Android Library
+
+        ## 文件说明
+
+        - `lib/arm64-v8a/libhackcomp.so` - ARM64 架构（现代 64 位 Android 设备）
+        - `lib/armeabi-v7a/libhackcomp.so` - ARMv7 架构（旧的 32 位设备）
+        - `lib/x86_64/libhackcomp.so` - x86_64 架构（模拟器）
+
+        ## 使用方式
+
+        ### 1. LSPosed 模块集成
+
+        将 `lib` 目录复制到您的 LSPosed 模块项目的 `src/main/jniLibs/` 目录：
+
+        ```
+        YourLSPosedModule/
+        └── app/
+            └── src/
+                └── main/
+                    └── jniLibs/
+                        ├── arm64-v8a/
+                        │   └── libhackcomp.so
+                        ├── armeabi-v7a/
+                        │   └── libhackcomp.so
+                        └── x86_64/
+                            └── libhackcomp.so
+        ```
+
+        ### 2. 在 Java 代码中加载
+
+        ```java
+        static {
+            System.loadLibrary("hackcomp");
+        }
+        ```
+
+        ### 3. 通过 JNI 调用
+
+        需要在 Rust 代码中实现 JNI 接口（待后续添加）。
+
+        ## 版本信息
+
+        - 构建时间: $(date -u)
+        - Git Commit: ${GITHUB_SHA:0:7}
+        - Build Type: Release (stripped)
+
+        ## 架构选择
+
+        - 大多数现代 Android 设备使用 **arm64-v8a**
+        - 模拟器通常使用 **x86_64**
+        - 如果不确定，包含所有架构，Android 会自动选择
+        EOF
+
+        cp package/README.md package-debug/README.md
+
+    - name: Create zip packages
+      run: |
+        cd package && zip -r ../hackcomp-android-libs-release.zip . && cd ..
+        cd package-debug && zip -r ../hackcomp-android-libs-debug.zip . && cd ..
+
+    - name: Upload release package
+      uses: actions/upload-artifact@v4
+      with:
+        name: hackcomp-android-libs-release
+        path: hackcomp-android-libs-release.zip
+
+    - name: Upload debug package
+      uses: actions/upload-artifact@v4
+      with:
+        name: hackcomp-android-libs-debug
+        path: hackcomp-android-libs-debug.zip
+
+    - name: Generate build summary
+      run: |
+        echo "## 📦 Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ Successfully built libhackcomp.so for all architectures" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### File Sizes" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "#### Release (Stripped)" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        ls -lh package/lib/*/libhackcomp.so >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "#### Debug (With Symbols)" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        ls -lh package-debug/lib/*/libhackcomp.so >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Download" >> $GITHUB_STEP_SUMMARY
+        echo "- Download artifacts from the 'Artifacts' section above" >> $GITHUB_STEP_SUMMARY
+        echo "- Use **release** version for production" >> $GITHUB_STEP_SUMMARY
+        echo "- Use **debug** version for development (contains symbols)" >> $GITHUB_STEP_SUMMARY

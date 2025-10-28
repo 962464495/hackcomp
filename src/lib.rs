@@ -5,6 +5,10 @@ mod hooks;
 pub mod procfs;
 mod seccomp;
 
+// JNI 接口模块（用于 LSPosed 集成）
+#[cfg(target_os = "android")]
+pub mod jni;
+
 use std::collections::{BTreeMap, HashSet};
 
 pub use error::*;
