@@ -7,6 +7,14 @@ use log::debug;
 use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition};
 pub use syscalls::Sysno; // Re-export Sysno for convenience
 
+/// SO 地址范围（用于 SO 过滤）
+#[derive(Debug, Clone)]
+pub struct SoAddressRange {
+    pub name: String,
+    pub start: usize,
+    pub end: usize,
+}
+
 pub trait MappedNode: std::fmt::Debug {
     fn lseek(&mut self, offset: usize, whence: usize) -> usize;
     fn read(&mut self, count: usize) -> Vec<u8>;
@@ -58,12 +66,36 @@ fn write_string_to_usize(s: &str, ptr: usize, max_len: usize) {
 
 pub struct SysLogger {
     hooked_syscalls: Vec<Sysno>,
+    so_filter_mode: u8, // 0=ALL, 1=WHITELIST, 2=BLACKLIST
+    so_ranges: Vec<SoAddressRange>,
 }
 
 impl SysLogger {
-    pub fn new(hooked_syscalls: &[Sysno]) -> Self {
+    pub fn new(hooked_syscalls: &[Sysno], so_filter_mode: u8, so_ranges: Vec<SoAddressRange>) -> Self {
         Self {
             hooked_syscalls: hooked_syscalls.to_vec(),
+            so_filter_mode,
+            so_ranges,
+        }
+    }
+
+    /// 检查调用地址是否应该被监控
+    fn should_log(&self, call_addr: usize) -> bool {
+        match self.so_filter_mode {
+            0 => true, // ALL: 监控所有
+            1 => {
+                // WHITELIST: 只监控列表中的 SO
+                self.so_ranges.iter().any(|range| {
+                    call_addr >= range.start && call_addr <= range.end
+                })
+            }
+            2 => {
+                // BLACKLIST: 排除列表中的 SO
+                !self.so_ranges.iter().any(|range| {
+                    call_addr >= range.start && call_addr <= range.end
+                })
+            }
+            _ => true, // 默认监控所有
         }
     }
 }
@@ -85,11 +117,17 @@ impl SyscallHook for SysLogger {
     }
 
     fn before(&mut self, ctx: &mut SyscallContext) {
+        // 检查是否应该记录此调用
+        if !self.should_log(ctx.call_addr) {
+            return;
+        }
+
         debug!(
-            "PID {} TID {} {}",
+            "[SysLogger] PID {} TID {} {} | PC: 0x{:x}",
             unsafe { nc::getpid() },
             unsafe { nc::gettid() },
-            get_thread_name()
+            get_thread_name(),
+            ctx.call_addr
         );
         match ctx.syscall_number {
             Sysno::openat => {

@@ -12,6 +12,7 @@ use jni::sys::{jboolean, jint, jintArray, jlong, jstring, JNI_VERSION_1_6};
 use jni::JNIEnv;
 use log::{error, info, warn};
 use syscalls::Sysno;
+use std::path::PathBuf;
 
 use crate::Builder;
 
@@ -59,7 +60,11 @@ pub extern "system" fn JNI_OnLoad(
 ///     int[] syscalls,
 ///     boolean enableLogger,
 ///     boolean hideSeccomp,
-///     boolean hideMaps
+///     boolean hideMaps,
+///     int soFilterMode,
+///     String[] soFilterList,
+///     String[] fdRedirectFrom,
+///     String[] fdRedirectTo
 /// );
 /// ```
 ///
@@ -68,6 +73,10 @@ pub extern "system" fn JNI_OnLoad(
 /// - enableLogger: 是否启用日志
 /// - hideSeccomp: 是否隐藏 seccomp
 /// - hideMaps: 是否隐藏内存映射
+/// - soFilterMode: SO 过滤模式 (0=ALL, 1=WHITELIST, 2=BLACKLIST)
+/// - soFilterList: SO 名称列表（用于白名单/黑名单）
+/// - fdRedirectFrom: 文件重定向源路径数组
+/// - fdRedirectTo: 文件重定向目标路径数组
 ///
 /// 返回值：
 /// - 0: 成功
@@ -80,6 +89,10 @@ pub extern "system" fn Java_com_security_syscallmonitor_HackcompJNI_install(
     enable_logger: jboolean,
     hide_seccomp: jboolean,
     hide_maps: jboolean,
+    so_filter_mode: jint,
+    so_filter_list: jni::objects::JObjectArray,
+    fd_redirect_from: jni::objects::JObjectArray,
+    fd_redirect_to: jni::objects::JObjectArray,
 ) -> jlong {
     info!("=================================================");
     info!("Installing Hackcomp Hooks from Java...");
@@ -93,11 +106,64 @@ pub extern "system" fn Java_com_security_syscallmonitor_HackcompJNI_install(
         }
     };
 
+    // 解析 SO 过滤列表
+    let so_filter_list = match parse_string_array(&mut env, so_filter_list) {
+        Ok(list) => list,
+        Err(e) => {
+            error!("Failed to parse SO filter list: {:?}", e);
+            return -1;
+        }
+    };
+
+    // 解析 FD 重定向配置
+    let fd_redirect_from_list = match parse_string_array(&mut env, fd_redirect_from) {
+        Ok(list) => list,
+        Err(e) => {
+            error!("Failed to parse FD redirect from list: {:?}", e);
+            return -1;
+        }
+    };
+
+    let fd_redirect_to_list = match parse_string_array(&mut env, fd_redirect_to) {
+        Ok(list) => list,
+        Err(e) => {
+            error!("Failed to parse FD redirect to list: {:?}", e);
+            return -1;
+        }
+    };
+
+    // 验证 FD 重定向配置
+    if fd_redirect_from_list.len() != fd_redirect_to_list.len() {
+        error!(
+            "FD redirect lists length mismatch: from={}, to={}",
+            fd_redirect_from_list.len(),
+            fd_redirect_to_list.len()
+        );
+        return -1;
+    }
+
     info!("Configuration:");
     info!("  - Syscalls to monitor: {} items", syscall_list.len());
     info!("  - Enable Logger: {}", enable_logger != 0);
     info!("  - Hide Seccomp: {}", hide_seccomp != 0);
     info!("  - Hide Maps: {}", hide_maps != 0);
+    info!("  - SO Filter Mode: {} (0=ALL, 1=WHITELIST, 2=BLACKLIST)", so_filter_mode);
+    info!("  - SO Filter List: {} items", so_filter_list.len());
+    for so in &so_filter_list {
+        info!("    - {}", so);
+    }
+    info!("  - FD Redirects: {} rules", fd_redirect_from_list.len());
+    for (from, to) in fd_redirect_from_list.iter().zip(fd_redirect_to_list.iter()) {
+        info!("    - {} -> {}", from, to);
+    }
+
+    // 查找 SO 地址范围（如果需要过滤）
+    let so_ranges = if so_filter_mode != 0 && !so_filter_list.is_empty() {
+        info!("Finding SO address ranges...");
+        find_so_ranges(&so_filter_list)
+    } else {
+        Vec::new()
+    };
 
     // 构建 Hackcomp
     let mut builder = Builder::new();
@@ -105,7 +171,11 @@ pub extern "system" fn Java_com_security_syscallmonitor_HackcompJNI_install(
     // 添加系统调用日志 Hook
     if enable_logger != 0 && !syscall_list.is_empty() {
         info!("Adding SysLogger hook for {} syscalls", syscall_list.len());
-        builder = builder.add_hook(crate::SysLogger::new(&syscall_list));
+        builder = builder.add_hook(crate::SysLogger::new(
+            &syscall_list,
+            so_filter_mode as u8,
+            so_ranges.clone(),
+        ));
     }
 
     // 添加隐藏 Seccomp Hook
@@ -121,6 +191,26 @@ pub extern "system" fn Java_com_security_syscallmonitor_HackcompJNI_install(
             "hackcomp",
             "libhackcomp",
         ]));
+    }
+
+    // 添加文件重定向 Hook
+    for (from, to) in fd_redirect_from_list.iter().zip(fd_redirect_to_list.iter()) {
+        info!("Adding FDRedirect: {} -> {}", from, to);
+        let from_path = PathBuf::from(from);
+        let to_path = PathBuf::from(to);
+
+        // 验证路径是否存在
+        if !from_path.exists() {
+            warn!("FDRedirect from path does not exist: {}", from);
+            // 不返回错误，继续安装其他 hook
+            continue;
+        }
+        if !to_path.exists() {
+            warn!("FDRedirect to path does not exist: {}", to);
+            continue;
+        }
+
+        builder = builder.add_hook(crate::FDRedirect::new(from_path, to_path));
     }
 
     // 构建并安装
@@ -221,4 +311,70 @@ pub extern "system" fn Java_com_security_syscallmonitor_HackcompJNI_getVersion(
     let version = env!("CARGO_PKG_VERSION");
     let output = env.new_string(version).unwrap();
     output.into_raw()
+}
+
+/// SO 地址范围
+pub use crate::SoAddressRange;
+
+/// 辅助函数：解析 Java String 数组为 Rust Vec<String>
+fn parse_string_array(env: &mut JNIEnv, array: jni::objects::JObjectArray) -> Result<Vec<String>, String> {
+    let len = env
+        .get_array_length(&array)
+        .map_err(|e| format!("Failed to get array length: {:?}", e))? as usize;
+
+    if len == 0 {
+        return Ok(vec![]);
+    }
+
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let jstr = env
+            .get_object_array_element(&array, i as i32)
+            .map_err(|e| format!("Failed to get element {}: {:?}", i, e))?;
+
+        let rust_str = env
+            .get_string(&jstr.into())
+            .map_err(|e| format!("Failed to convert to string: {:?}", e))?
+            .to_string_lossy()
+            .into_owned();
+
+        result.push(rust_str);
+    }
+
+    Ok(result)
+}
+
+/// 从 /proc/self/maps 查找 SO 的地址范围
+fn find_so_ranges(so_names: &[String]) -> Vec<SoAddressRange> {
+    let mut ranges = Vec::new();
+
+    let maps = match crate::procfs::parse_proc_maps(None) {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Failed to parse /proc/self/maps: {:?}", e);
+            return ranges;
+        }
+    };
+
+    for entry in maps {
+        if let Some(pathname) = &entry.pathname {
+            for so_name in so_names {
+                // 匹配 SO 名称（支持部分匹配）
+                if pathname.contains(so_name) {
+                    ranges.push(SoAddressRange {
+                        name: pathname.clone(),
+                        start: entry.start_address,
+                        end: entry.end_address,
+                    });
+                    info!(
+                        "Found SO: {} @ 0x{:x}-0x{:x}",
+                        pathname, entry.start_address, entry.end_address
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    ranges
 }
