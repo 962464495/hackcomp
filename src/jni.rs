@@ -7,14 +7,13 @@
 /// - install: 接收配置并安装 Seccomp hooks
 /// - 配置结构体：从 Java 传递系统调用列表和选项
 
-use jni::objects::{JClass, JObject, JString};
+use jni::objects::{JClass, JIntArray};
 use jni::sys::{jboolean, jint, jintArray, jlong, jstring, JNI_VERSION_1_6};
 use jni::JNIEnv;
 use log::{error, info, warn};
-use std::path::PathBuf;
 use syscalls::Sysno;
 
-use crate::{Builder, Error};
+use crate::Builder;
 
 /// 初始化 Android Logger
 /// 使用 tag "Hackcomp" 输出到 logcat
@@ -36,7 +35,7 @@ fn init_logger() {
 /// 这个函数会在 System.loadLibrary("hackcomp") 时被调用
 ///
 /// 返回值：JNI 版本号
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn JNI_OnLoad(
     _vm: *mut jni::sys::JavaVM,
     _reserved: *mut std::ffi::c_void,
@@ -50,39 +49,6 @@ pub extern "system" fn JNI_OnLoad(
     info!("=================================================");
 
     JNI_VERSION_1_6 as jint
-}
-
-/// 配置结构体
-///
-/// 从 Java 层传递到 Rust 层的配置信息
-#[derive(Debug, Clone)]
-pub struct HackcompConfig {
-    /// 要监控的系统调用编号列表
-    pub syscalls: Vec<Sysno>,
-
-    /// 是否启用系统调用日志
-    pub enable_logger: bool,
-
-    /// 是否隐藏 Seccomp 状态
-    pub hide_seccomp: bool,
-
-    /// 是否隐藏内存映射（隐藏 libhackcomp.so）
-    pub hide_maps: bool,
-
-    /// 文件重定向：源路径 -> 目标路径
-    pub redirect_files: Vec<(PathBuf, PathBuf)>,
-}
-
-impl Default for HackcompConfig {
-    fn default() -> Self {
-        Self {
-            syscalls: vec![],
-            enable_logger: true,
-            hide_seccomp: true,
-            hide_maps: true,
-            redirect_files: vec![],
-        }
-    }
 }
 
 /// Java 调用入口：安装 Hooks
@@ -106,7 +72,7 @@ impl Default for HackcompConfig {
 /// 返回值：
 /// - 0: 成功
 /// - -1: 失败
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_security_syscallmonitor_HackcompJNI_install(
     mut env: JNIEnv,
     _class: JClass,
@@ -151,9 +117,9 @@ pub extern "system" fn Java_com_security_syscallmonitor_HackcompJNI_install(
     // 添加隐藏内存映射 Hook
     if hide_maps != 0 {
         info!("Adding HideMaps hook (hiding 'hackcomp' and 'libhackcomp')");
-        builder = builder.add_hook(crate::HideMaps::new(vec![
-            "hackcomp".to_string(),
-            "libhackcomp".to_string(),
+        builder = builder.add_hook(crate::HideMaps::new(&[
+            "hackcomp",
+            "libhackcomp",
         ]));
     }
 
@@ -185,9 +151,12 @@ pub extern "system" fn Java_com_security_syscallmonitor_HackcompJNI_install(
 
 /// 辅助函数：解析 Java int 数组为 Rust Vec<Sysno>
 fn parse_syscall_array(env: &mut JNIEnv, array: jintArray) -> Result<Vec<Sysno>, String> {
+    // 将 jintArray 转换为 JIntArray
+    let array_obj = unsafe { JIntArray::from_raw(array) };
+
     // 获取数组长度
     let len = env
-        .get_array_length(&array)
+        .get_array_length(&array_obj)
         .map_err(|e| format!("Failed to get array length: {:?}", e))? as usize;
 
     if len == 0 {
@@ -197,7 +166,7 @@ fn parse_syscall_array(env: &mut JNIEnv, array: jintArray) -> Result<Vec<Sysno>,
 
     // 读取数组内容
     let mut buf = vec![0i32; len];
-    env.get_int_array_region(&array, 0, &mut buf)
+    env.get_int_array_region(&array_obj, 0, &mut buf)
         .map_err(|e| format!("Failed to read array: {:?}", e))?;
 
     // 转换为 Sysno
@@ -228,7 +197,7 @@ fn parse_syscall_array(env: &mut JNIEnv, array: jintArray) -> Result<Vec<Sysno>,
 /// ```java
 /// public static native boolean isInstalled();
 /// ```
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_security_syscallmonitor_HackcompJNI_isInstalled(
     _env: JNIEnv,
     _class: JClass,
@@ -244,26 +213,12 @@ pub extern "system" fn Java_com_security_syscallmonitor_HackcompJNI_isInstalled(
 /// ```java
 /// public static native String getVersion();
 /// ```
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_security_syscallmonitor_HackcompJNI_getVersion(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
 ) -> jstring {
     let version = env!("CARGO_PKG_VERSION");
     let output = env.new_string(version).unwrap();
     output.into_raw()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_default() {
-        let config = HackcompConfig::default();
-        assert!(config.enable_logger);
-        assert!(config.hide_seccomp);
-        assert!(config.hide_maps);
-        assert_eq!(config.syscalls.len(), 0);
-    }
 }

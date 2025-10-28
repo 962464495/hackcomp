@@ -9,7 +9,7 @@ mod seccomp;
 #[cfg(target_os = "android")]
 pub mod jni;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 pub use error::*;
 pub use hooks::*;

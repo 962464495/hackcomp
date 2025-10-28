@@ -4,7 +4,7 @@ use std::{
 };
 
 use log::debug;
-use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
+use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition};
 pub use syscalls::Sysno; // Re-export Sysno for convenience
 
 pub trait MappedNode: std::fmt::Debug {
@@ -50,7 +50,6 @@ fn usize_to_string(ptr: usize) -> String {
 fn write_string_to_usize(s: &str, ptr: usize, max_len: usize) {
     let c_string = CString::new(s).unwrap();
     let bytes = c_string.as_bytes_with_nul();
-    let len = std::cmp::min(bytes.len(), max_len);
     let len = bytes.len();
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len);
@@ -269,7 +268,7 @@ impl SyscallHook for FDRedirect {
                 }
             }
             Sysno::readlinkat => {
-                let dirfd = ctx.args[0];
+                let _dirfd = ctx.args[0];
                 let pathname = usize_to_string(ctx.args[1]);
                 let buf = ctx.args[2];
                 let bufsize = ctx.args[3];

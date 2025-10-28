@@ -1,9 +1,5 @@
-use std::{
-    arch::asm,
-    ffi::{c_int, c_void},
-};
+use std::ffi::{c_int, c_void};
 
-use log::info;
 use syscalls::Sysno;
 
 #[repr(C)]
