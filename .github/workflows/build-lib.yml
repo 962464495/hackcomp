@@ -18,21 +18,14 @@ jobs:
       matrix:
         # 编译 debug 和 release 两个版本
         build_type: [debug, release]
-        # 支持多个架构
-        target: [aarch64, armv7, x86_64]
+        # 只支持 ARM64 (真机使用)
+        # 移除 armv7 (nc crate 编译问题) 和 x86_64 (不需要模拟器)
+        target: [aarch64]
         include:
           - target: aarch64
             rust_target: aarch64-linux-android
             ndk_target: arm64-v8a
             ndk_clang: aarch64-linux-android21-clang
-          - target: armv7
-            rust_target: armv7-linux-androideabi
-            ndk_target: armeabi-v7a
-            ndk_clang: armv7a-linux-androideabi21-clang
-          - target: x86_64
-            rust_target: x86_64-linux-android
-            ndk_target: x86_64
-            ndk_clang: x86_64-linux-android21-clang
 
     steps:
     - name: Checkout code
@@ -110,22 +103,14 @@ jobs:
     - name: Create package structure
       run: |
         mkdir -p package/lib/arm64-v8a
-        mkdir -p package/lib/armeabi-v7a
-        mkdir -p package/lib/x86_64
 
         # 复制 release 版本（推荐用于生产）
         cp artifacts/libhackcomp-aarch64-release/libhackcomp.so package/lib/arm64-v8a/
-        cp artifacts/libhackcomp-armv7-release/libhackcomp.so package/lib/armeabi-v7a/
-        cp artifacts/libhackcomp-x86_64-release/libhackcomp.so package/lib/x86_64/
 
         # 创建调试版本目录
         mkdir -p package-debug/lib/arm64-v8a
-        mkdir -p package-debug/lib/armeabi-v7a
-        mkdir -p package-debug/lib/x86_64
 
         cp artifacts/libhackcomp-aarch64-debug/libhackcomp.so package-debug/lib/arm64-v8a/
-        cp artifacts/libhackcomp-armv7-debug/libhackcomp.so package-debug/lib/armeabi-v7a/
-        cp artifacts/libhackcomp-x86_64-debug/libhackcomp.so package-debug/lib/x86_64/
 
     - name: Create README
       run: |
@@ -134,9 +119,14 @@ jobs:
 
         ## 文件说明
 
-        - `lib/arm64-v8a/libhackcomp.so` - ARM64 架构（现代 64 位 Android 设备）
-        - `lib/armeabi-v7a/libhackcomp.so` - ARMv7 架构（旧的 32 位设备）
-        - `lib/x86_64/libhackcomp.so` - x86_64 架构（模拟器）
+        - `lib/arm64-v8a/libhackcomp.so` - ARM64 架构（64 位 Android 设备）
+
+        **架构支持说明**:
+        - ✅ ARM64 (arm64-v8a) - 现代 Android 10+ 64位设备
+        - ❌ ARMv7 (armeabi-v7a) - nc crate 编译失败
+        - ❌ x86_64 - 不需要模拟器支持
+
+        **最低要求**: Android 10+ 64位设备
 
         ## 使用方式
 
@@ -150,11 +140,7 @@ jobs:
             └── src/
                 └── main/
                     └── jniLibs/
-                        ├── arm64-v8a/
-                        │   └── libhackcomp.so
-                        ├── armeabi-v7a/
-                        │   └── libhackcomp.so
-                        └── x86_64/
+                        └── arm64-v8a/
                             └── libhackcomp.so
         ```
 
