@@ -386,12 +386,14 @@ impl HideMaps {
 
     fn modify_maps(&self, original: &str) -> Vec<u8> {
         let mut modified = String::new();
-        for line in original.lines() {
+        'outer: for line in original.lines() {
+            // Check if any keyword matches this line
             for k in &self.keywords {
                 if line.contains(k) {
-                    continue;
+                    continue 'outer;  // Skip this line entirely
                 }
             }
+            // No keyword matched, keep this line
             modified.push_str(line);
             modified.push('\n');
         }

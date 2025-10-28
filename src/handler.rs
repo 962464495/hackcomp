@@ -77,7 +77,26 @@ pub unsafe extern "C" fn sigsys_handler(
 
         let sysno = ctx.syscall_number;
         // OnceLock will make sure no two handlers run concurrently
-        let mut h = crate::Hackcomp::get_installed().unwrap();
+        let mut h = match crate::Hackcomp::get_installed() {
+            Some(guard) => guard,
+            None => {
+                // Hackcomp not installed yet - execute syscall normally and return
+                let r = match syscalls::syscall6(
+                    ctx.syscall_number,
+                    ctx.args[0],
+                    ctx.args[1],
+                    ctx.args[2],
+                    ctx.args[3],
+                    ctx.args[4],
+                    ctx.args[5],
+                ) {
+                    Ok(ret) => ret,
+                    Err(e) => (-e.into_raw() as isize) as usize,
+                };
+                set_ret(context, r);
+                return;
+            }
+        };
         let mut hooks = h
             .syscall_hooks
             .iter_mut()
